@@ -1,4 +1,4 @@
-# ci-daemon
+# Templates
 
 Templates is a win32 application. It will create templates for work documents for you based on information gleaned from case information stored on your machine. See ci-daemon on gathering some of this information automatically. 
 
