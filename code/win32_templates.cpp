@@ -20,18 +20,30 @@ typedef int64_t s64;
 #pragma comment (lib, "kernel32")
 #pragma comment (lib, "user32")
 
-internal void Resize_DIB_Section(HWND Window);
-internal void win32_updatewindow(HWND Window);
 
-
-struct Win32BitmapContainer 
+struct Win32BackBuffer
 {
+	bool is_init;
 	BITMAPINFO info;
 	int bytes_per_pixel;
+	bool needs_blitting;
 	void *memory;
 } ;
 
-global struct Win32BitmapContainer g_BitmapContainer;
+struct NormalRect
+{
+	int x;
+	int y;
+	int width;
+	int height;
+}; 
+
+internal void Resize_DIB_Section(HWND Window);
+internal void win32_DrawtoBackBuffer(HWND Window);
+internal void win32_BlittoScreen(HWND Window, HDC dc, int x, int y, int width, int height); 
+internal NormalRect win32_GetClientDimensions(HWND Window);
+
+global struct Win32BackBuffer g_BackBuffer;
 
 LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM wParam, LPARAM lParam)
 {
@@ -48,8 +60,15 @@ LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM wParam, LPARAM lPa
 			Resize_DIB_Section(Window);
 			break;
 		case WM_PAINT:
-			win32_updatewindow(Window);
-			break;
+			{
+			PAINTSTRUCT Paint;
+			HDC dc = BeginPaint(Window, &Paint);
+			win32_BlittoScreen(Window, dc, Paint.rcPaint.left, 
+						       Paint.rcPaint.top, 
+						       Paint.rcPaint.right - Paint.rcPaint.left, 
+						       Paint.rcPaint.bottom - Paint.rcPaint.top);
+			EndPaint(Window, &Paint);
+			} break;
 		default:
 			Result = DefWindowProc(Window, Message, wParam, lParam);
 			break;
@@ -98,6 +117,18 @@ void  WinMainCRTStartup()
 			TranslateMessage(&Message);
 			DispatchMessage(&Message);
 		}
+		win32_DrawtoBackBuffer(Window);
+		if(g_BackBuffer.needs_blitting)
+		{
+			HDC dc = GetDC(Window);
+			NormalRect normal_rect = win32_GetClientDimensions(Window);
+			win32_BlittoScreen(Window, dc, normal_rect.x, 
+						       normal_rect.y, 
+						       normal_rect.width, 
+						       normal_rect.height); 
+			g_BackBuffer.needs_blitting = false;
+		}
+
 		Sleep(100);
 	}
 
@@ -106,47 +137,54 @@ void  WinMainCRTStartup()
 
 internal void Resize_DIB_Section(HWND Window)
 {
-	if(g_BitmapContainer.memory)
-	{
-		VirtualFree(g_BitmapContainer.memory, 0, MEM_RELEASE);
-	}
+	if(g_BackBuffer.memory)
+		VirtualFree(g_BackBuffer.memory, 0, MEM_RELEASE);
 
-	RECT client_rect;
-	GetClientRect(Window, &client_rect);
-	int width = client_rect.right - client_rect.left;
-	int height = client_rect.bottom - client_rect.top;
+	NormalRect normal_rect = win32_GetClientDimensions(Window);
+	int width = normal_rect.width;
+	int height = normal_rect.height;
 
 	{
-		g_BitmapContainer.info.bmiHeader.biSize = sizeof(g_BitmapContainer.info.bmiHeader);
-		g_BitmapContainer.info.bmiHeader.biWidth = width; 
-		g_BitmapContainer.info.bmiHeader.biHeight = -height;  // we are forcing an inversion of the win32 API draw order here, since it goes bottom up
-		g_BitmapContainer.info.bmiHeader.biPlanes = 1; 
-		g_BitmapContainer.info.bmiHeader.biBitCount = 32; 
-		g_BitmapContainer.info.bmiHeader.biCompression = BI_RGB; 
-		g_BitmapContainer.info.bmiHeader.biSizeImage = 0; 
-		g_BitmapContainer.info.bmiHeader.biXPelsPerMeter = 0; 
-		g_BitmapContainer.info.bmiHeader.biYPelsPerMeter = 0; 
-		g_BitmapContainer.info.bmiHeader.biClrUsed = 0; 
-		g_BitmapContainer.info.bmiHeader.biClrImportant = 0; 
+		g_BackBuffer.info.bmiHeader.biSize = sizeof(g_BackBuffer.info.bmiHeader);
+		g_BackBuffer.info.bmiHeader.biWidth = width; 
+		g_BackBuffer.info.bmiHeader.biHeight = -height;  // we are forcing an inversion of the win32 API draw order here, since it goes bottom up
+		g_BackBuffer.info.bmiHeader.biPlanes = 1; 
+		g_BackBuffer.info.bmiHeader.biBitCount = 32; 
+		g_BackBuffer.info.bmiHeader.biCompression = BI_RGB; 
+		g_BackBuffer.info.bmiHeader.biSizeImage = 0; 
+		g_BackBuffer.info.bmiHeader.biXPelsPerMeter = 0; 
+		g_BackBuffer.info.bmiHeader.biYPelsPerMeter = 0; 
+		g_BackBuffer.info.bmiHeader.biClrUsed = 0; 
+		g_BackBuffer.info.bmiHeader.biClrImportant = 0; 
 	}
 
-	g_BitmapContainer.bytes_per_pixel = 4;
-	
-	int bitmap_memory_size = g_BitmapContainer.bytes_per_pixel * (width * height);
+	g_BackBuffer.bytes_per_pixel = 4;
+	int bitmap_memory_size = g_BackBuffer.bytes_per_pixel * (width * height);
 
-	g_BitmapContainer.memory = VirtualAlloc(0, bitmap_memory_size, MEM_COMMIT, PAGE_READWRITE);
+	g_BackBuffer.memory = VirtualAlloc(0, bitmap_memory_size, MEM_COMMIT, PAGE_READWRITE);
+	if(g_BackBuffer.memory)
+	{
+		// TODO: The blit does not occur while resizing, despite a redraw
+		// To solve this problem, we're drawing to the backbuffer here, but
+		// this still causes flicker. Double buffer may fix
+		g_BackBuffer.is_init = true;
+		win32_DrawtoBackBuffer(Window);
+		g_BackBuffer.needs_blitting = true;
+	}
 
 }
 
-internal void win32_renderbitmap(HWND Window)
+internal void win32_DrawtoBackBuffer(HWND Window)
 {
-	RECT client_rect;
-	GetClientRect(Window, &client_rect);
-	int width = client_rect.right - client_rect.left;
-	int height = client_rect.bottom - client_rect.top;
+	if(!g_BackBuffer.memory || !g_BackBuffer.needs_blitting)
+		return;
 
-	int pitch = width * g_BitmapContainer.bytes_per_pixel;
-	u8 *row = (u8 *)g_BitmapContainer.memory;
+	NormalRect normal_rect = win32_GetClientDimensions(Window);
+	int width = normal_rect.width;
+	int height = normal_rect.height;
+
+	int pitch = width * g_BackBuffer.bytes_per_pixel;
+	u8 *row = (u8 *)g_BackBuffer.memory;
 	for(int y = 0; y < height; ++y)
 	{
 		u32 *pixel = (u32 *)row;
@@ -161,32 +199,36 @@ internal void win32_renderbitmap(HWND Window)
 		}
 		row += pitch;
 	}
+
 }
 
-internal void win32_updatewindow(HWND Window) 
+internal void win32_BlittoScreen(HWND Window, HDC dc, int x, int y, int width, int height) 
 {
-	win32_renderbitmap(Window);
 
 	// BEGIN WINDOWS BLIT
-	
 
-	PAINTSTRUCT Paint;
-	HDC dc = BeginPaint(Window, &Paint);
-
-	int x = Paint.rcPaint.left;
-	int y = Paint.rcPaint.top;
-	int width = Paint.rcPaint.right - Paint.rcPaint.left;
-	int height = Paint.rcPaint.bottom - Paint.rcPaint.top;
-
-	// TODO: we are drawing only the "dirty" or messed up area of a window right now; 
-	// but need to figure out a switch to switch to drawing blit the entire client area
-	StretchDIBits(dc, x, y, width, height,  // destination
+	int tmp = StretchDIBits(dc, x, y, width, height,  // destination
 				      x, y, width, height, // source
-				      g_BitmapContainer.memory, 
-				      &g_BitmapContainer.info, 
+				      g_BackBuffer.memory, 
+				      &g_BackBuffer.info, 
 				      DIB_RGB_COLORS, SRCCOPY);
 	
-	EndPaint(Window, &Paint);
+}
+
+internal NormalRect win32_GetClientDimensions(HWND Window)
+{
+	
+	RECT client_rect;
+	NormalRect normal_rect;
+	GetClientRect(Window, &client_rect);
+
+	normal_rect.width = client_rect.right - client_rect.left;
+	normal_rect.height = client_rect.bottom - client_rect.top;
+	normal_rect.x = client_rect.left;
+	normal_rect.y = client_rect.top;
+
+	return normal_rect;
+
 }
 
 // replacements for surreptitiously called funcs in CRT so we can function without CRT
